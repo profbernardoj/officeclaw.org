@@ -2,6 +2,91 @@
 
 All notable changes to EverClaw are documented here.
 
+## [2026.6.18.2357] - 2026-06-18
+
+### Bug Fixes — Revert OpenClaw Pin + CIG Model Prefix
+
+- **Dockerfile:** Reverted `OPENCLAW_VERSION` from `v2026.6.8` → `v2026.5.27`. OpenClaw v2026.6.8 broke the SSO Session Bridge (auth-proxy trusted-proxy mode). Reverting restores SSO functionality. Update banner is suppressed via `update.checkOnStart=false` in openclaw-default.json (from v2026.6.18.2214).
+- **supabase/functions/cig-inference/index.ts:** Strip provider prefix from model name before tier check (carried forward from v2026.6.18.2214). OpenClaw sends `mor-gateway/deepseek-v4-flash` but CIG expects bare `deepseek-v4-flash`. Uses `lastIndexOf("/")` with unconditional `reqBody.model = model` normalization.
+
+## [2026.6.18.2214] - 2026-06-18
+
+### Bug Fixes — Update Banner + CIG Model Prefix
+
+- **Dockerfile:** Bumped `OPENCLAW_VERSION` from `v2026.5.27` → `v2026.6.8`. Resolves stale "Update available" banner on InstallOpenClaw.xyz containers.
+- **config/openclaw-default.json:** Added `update.checkOnStart: false`. Suppresses the in-app "Update Now" button that fails with `checkout-failed` on Docker containers (containers are immutable images and cannot self-update via git checkout).
+- **supabase/functions/cig-inference/index.ts:** Strip provider prefix from model name before tier check. OpenClaw sends `mor-gateway/deepseek-v4-flash` but CIG's free-tier allowlist and Morpheus API expect bare `deepseek-v4-flash`. Without stripping, the first check fails, triggers a downgrade retry, and the initial response shows "assistant turn failed before producing content". Fix uses `lastIndexOf("/")` with empty fallback to `"default"`.
+
+## [2026.6.18.1803] - 2026-06-18
+
+### SSO Session Bridge (Single Sign-In)
+
+- **packages/core/auth-proxy/server.mjs:** Added `POST /auth/handoff` route for SSO session bridge. Accepts short-lived HS256 JWT via form-urlencoded POST body, verifies signature with dedicated `HANDOFF_SIGNING_SECRET`, validates FQDN match, calls `consume-handoff-token` Edge Function for DB-backed atomic single-use enforcement, verifies ownership via `verify-owner`, then sets session cookie and 302 redirects to `/`. Falls back to login page on any error. SSO auto-disables if `HANDOFF_SIGNING_SECRET` not set.
+- **supabase/functions/generate-handoff-token/index.ts:** New Edge Function. Verifies Privy JWT, validates deployment ownership, cleans up expired tokens, dedup check with unique partial index handling, generates 90s TTL HS256 JWT with JTI, stores in `handoff_tokens` table.
+- **supabase/functions/consume-handoff-token/index.ts:** New Edge Function. Atomic single-use consumption via `UPDATE WHERE consumed_at IS NULL AND expires_at > now()`. Returns 409 on already-consumed. Authenticated via `VERIFY_OWNER_SECRET`.
+- **supabase/migrations/20260618_handoff_tokens.sql:** New table with `jti` PK, `privy_user_id`, `fqdn`, `consumed_at`, `expires_at`. Unique partial index on `(privy_user_id, fqdn) WHERE consumed_at IS NULL` prevents concurrent active tokens. RLS enabled.
+- **supabase/functions/provision-buffer/index.ts:** Passes `HANDOFF_SIGNING_SECRET` and `CONSUME_HANDOFF_URL` env vars to container manifest.
+- **supabase/functions/deploy-agent/index.ts:** Same env var passthrough for cold deploy path.
+
+### Security
+
+- Dedicated `HANDOFF_SIGNING_SECRET` for HS256 JWT signing (separate from `VERIFY_OWNER_SECRET`)
+- 90-second TTL on handoff tokens (immediate handoff expected)
+- Single-use enforcement: in-memory Map (fast path) + DB atomic consume (survives restarts)
+- FQDN binding prevents token reuse across containers
+- Defense-in-depth: `verify-owner` call on success path
+- POST body delivery (not URL query param) prevents token leakage in browser history/referer
+
+## [2026.6.16.2136] - 2026-06-16
+
+### Added
+
+- **Tiered Installer** (`scripts/install-tiered.sh`): New unified installer with three tiers:
+  - **Minimal** (default): Core deps only — Node.js 24.x LTS, jq, git, curl, Morpheus proxy (~200MB)
+  - **Standard** (`--standard`): + Ollama/Gemma 4 12B, Signal, ffmpeg (~8.6GB)
+  - **Full** (`--full`): + Brave, Whisper, Gemma 4 26B, GitHub CLI, all channels (~19.6GB)
+  - **Custom** (`--with X,Y,Z`): Pick specific components
+  - Supports `--dry-run` to preview without installing and `--list` to show available components
+
+- **Component Libraries** (`scripts/lib/`):
+  - `install-core.sh` — Node.js, jq, git, curl with Homebrew/apt/dnf/pacman support
+  - `install-ollama.sh` — Ollama engine + model downloads (Gemma 4 12B, Gemma 4 26B)
+  - `install-signal.sh` — signal-cli with Java 21, version checking (≥0.14.3 required)
+  - `install-media.sh` — ffmpeg, Whisper (mlx-whisper on Apple Silicon), yt-dlp
+  - `install-browser.sh` — Brave Browser for web automation
+  - `install-channels.sh` — Setup instructions for Telegram, Discord, Slack, Matrix
+  - `install-dev.sh` — GitHub CLI for repository and issue management
+  - `install-utils.sh` — Logging, platform detection, size estimation
+
+- **Docker Optimized Image** (`everclaw-docker/Dockerfile.optimized`):
+  - Multi-stage build for smaller image size (~900 MB total)
+  - Node 20-slim base (avoids Node.js v25 SSE bugs)
+  - Includes: signal-cli 0.14.5 + Java 21, GitHub CLI, Brave Browser, Whisper, ffmpeg
+  - Pre-configured for containerized operation (bind 0.0.0.0, Morpheus provider)
+  - Non-root user for security
+  - Health check endpoint
+  - No Ollama/local models (uses Morpheus P2P for inference)
+
+- **Signal Troubleshooting Docs** (`docs/docs/operations/signal-troubleshooting.md`):
+  - signal-cli ≥0.14.3 requirement documented
+  - Node.js v25 SSE bug warning and workarounds
+  - Common issues: inbound not working, NullPointerException, SSE drops
+  - Verification commands and container mode alternative
+
+### Security
+
+- signal-cli Linux installer now uses jq for safe JSON parsing (with grep/sed fallback)
+- Added file type validation before extracting downloaded archives
+- Graceful process termination (SIGTERM before SIGKILL) in troubleshooting docs
+
+### Fixed
+
+- Pure bash `format_size()` implementation (no bc dependency)
+- Component name trimming for `--with` flag (handles spaces)
+- Proxy installation error handling with proper exit code capture
+
+---
+
 ## [2026.5.28.1854] - 2026-05-28
 
 ### OpenClaw Pin Bump v2026.5.22 → v2026.5.27

@@ -42,7 +42,7 @@
  */
 
 import { createServer } from 'node:http';
-import { randomBytes, timingSafeEqual, createHmac } from 'node:crypto';
+import { randomBytes, timingSafeEqual, createHmac, createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -67,6 +67,14 @@ const CONFIG = {
   verifyOwnerUrl: process.env.VERIFY_OWNER_URL || '',
   verifyOwnerSecret: process.env.VERIFY_OWNER_SECRET || '',
   containerFqdn: process.env.CONTAINER_FQDN || '',
+  // SSO handoff: dedicated secret for HS256 JWT verification (separate from verify-owner)
+  // Fetched from Supabase at startup to avoid env var pipeline mismatches.
+  // The env var is used as initial value; Supabase fetch overrides it in dynamic mode.
+  handoffSigningSecret: (process.env.HANDOFF_SIGNING_SECRET || '').trim(),
+  // Supabase endpoint to fetch HANDOFF_SIGNING_SECRET (avoids Manifest env var mismatch)
+  getHandoffSecretUrl: process.env.GET_HANDOFF_SECRET_URL || '',
+  // Consume-handoff endpoint (Supabase Edge Function) for DB-backed single-use enforcement
+  consumeHandoffUrl: process.env.CONSUME_HANDOFF_URL || '',
   // Login-page branding (set by provisioner; lobster is the OpenClaw default)
   brandName: process.env.BRAND_NAME || 'OpenClaw',
   brandIcon: process.env.BRAND_ICON || '🦞',
@@ -91,8 +99,11 @@ const CIG_CONFIG = {
   inferenceUrl: process.env.CIG_INFERENCE_URL || '',
   bindingSecret: process.env.CIG_BINDING_SECRET || '',
   containerFqdn: process.env.CIG_CONTAINER_FQDN || process.env.CONTAINER_FQDN || '',
+  fqdnLocked: !!(process.env.CIG_CONTAINER_FQDN || process.env.CONTAINER_FQDN),
 };
 const CIG_ENABLED = !!(CIG_CONFIG.mintUrl && CIG_CONFIG.inferenceUrl && CIG_CONFIG.bindingSecret);
+// Optional suffix restriction for auto-detected FQDNs (e.g. ".manifest0.net")
+const CIG_ALLOWED_FQDN_SUFFIX = process.env.CIG_ALLOWED_FQDN_SUFFIX || '';
 const CIG_TOKEN_TTL_MS = 10 * 60 * 1000;    // 10 minutes
 const CIG_TOKEN_REFRESH_MS = 60_000;         // Refresh 60s before expiry
 const CIG_FETCH_TIMEOUT_MS = 10_000;         // 10s timeout for CIG HTTP calls
@@ -139,7 +150,7 @@ setInterval(() => {
 
 // ─── Startup Validation ──────────────────────────────────────────────────────
 
-function validateConfig() {
+async function validateConfig() {
   const required = [
     ['PRIVY_APP_ID', CONFIG.privyAppId],
     ['PRIVY_VERIFICATION_KEY', CONFIG.privyVerificationKey],
@@ -179,6 +190,93 @@ function validateConfig() {
   } else {
     console.log(`   Mode:   STATIC (env var owner)`);
     console.log(`   Owner:  ${CONFIG.ownerPrivyId}`);
+  }
+  if (CONFIG.handoffSigningSecret) {
+    console.log(`   SSO:    ENABLED (env var — will verify via Supabase fetch)`);
+  } else {
+    console.log(`   SSO:    DISABLED (set HANDOFF_SIGNING_SECRET to enable)`);
+  }
+
+  // ── Fetch HANDOFF_SIGNING_SECRET from Supabase ──
+  // In dynamic mode, the env var passed through Manifest may not match Supabase.
+  // Fetch the canonical secret from Supabase to guarantee JWT sign/verify alignment.
+  if (DYNAMIC_OWNER_MODE && CONFIG.verifyOwnerSecret && CONFIG.verifyOwnerUrl) {
+    const handoffUrl = CONFIG.getHandoffSecretUrl ||
+      CONFIG.verifyOwnerUrl.replace('verify-owner', 'get-handoff-secret');
+    try {
+      const resp = await fetch(handoffUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${CONFIG.verifyOwnerSecret}`,
+        },
+        body: '{}',
+        signal: AbortSignal.timeout(10000),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.secret && typeof data.secret === 'string') {
+          CONFIG.handoffSigningSecret = data.secret.trim();
+          console.log(`   SSO:    ✓ Secret fetched from Supabase (len=${CONFIG.handoffSigningSecret.length})`);
+        } else {
+          console.warn(`   SSO:    ⚠ Supabase returned empty secret`);
+        }
+      } else {
+        console.warn(`   SSO:    ⚠ Supabase fetch returned ${resp.status}`);
+      }
+    } catch (fetchErr) {
+      console.warn(`   SSO:    ⚠ Supabase fetch failed: ${fetchErr.message}`);
+      console.warn(`   SSO:    Falling back to env var value (len=${CONFIG.handoffSigningSecret.length})`);
+    }
+  }
+}
+
+// ─── SSO Handoff: Single-Use Token Tracking ──────────────────────────────────
+// Two-layer replay prevention:
+// 1. In-memory Map<jti, timestamp> — instant check, pruned every 90s via setInterval
+// 2. Supabase handoff_tokens table — survives process restarts (consumed_at column)
+// The DB check is authoritative; in-memory is a fast-path optimization.
+const consumedHandoffTokens = new Map();
+const HANDOFF_TOKEN_TTL_MS = 90_000; // 90 seconds (matches JWT TTL)
+
+// Prune expired entries every 30 seconds to prevent memory leak
+setInterval(() => {
+  const now = Date.now();
+  for (const [jti, ts] of consumedHandoffTokens) {
+    if (now - ts > HANDOFF_TOKEN_TTL_MS) {
+      consumedHandoffTokens.delete(jti);
+    }
+  }
+}, 30_000).unref();
+
+// Supabase Edge Function helper for handoff token consumption (no service key in container)
+// Calls consume-handoff-token function with VERIFY_OWNER_SECRET for auth.
+// Returns { consumed: true } if token was valid and not previously consumed.
+async function dbConsumeHandoffToken(jti) {
+  if (!CONFIG.consumeHandoffUrl) return { consumed: true }; // Fallback: in-memory only
+  try {
+    const resp = await fetch(CONFIG.consumeHandoffUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${CONFIG.verifyOwnerSecret}`,
+      },
+      body: JSON.stringify({ jti }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (resp.status === 409) {
+      // Already consumed
+      return { consumed: false, error: 'already_consumed' };
+    }
+    if (!resp.ok) {
+      console.error(`[handoff] consume-handoff returned ${resp.status}`);
+      return { consumed: false, error: 'db_error' };
+    }
+    const result = await resp.json();
+    return { consumed: !!result.consumed };
+  } catch (err) {
+    console.error(`[handoff] consume-handoff error: ${err.message}`);
+    return { consumed: false, error: 'db_unavailable' };
   }
 }
 
@@ -466,16 +564,49 @@ proxy.on('error', (error, req, res) => {
 // Mints a CIG token (cached, refreshed 60s before expiry) and forwards
 // the inference request to the external CIG endpoint.
 
+// Auto-detect FQDN from Host header (one-time, only if not set via env).
+// Buffer containers don't know their FQDN at provision time; the first external
+// request carries the Manifest ingress hostname which we lock as the FQDN.
+// Security: CIG_ALLOWED_FQDN_SUFFIX restricts accepted FQDNs to a known ingress
+// domain (e.g. ".manifest0.net"), preventing Host-header poisoning.
+// Node.js is single-threaded so no mutex is needed for the fqdnLocked flag.
+function maybeAutoDetectFqdn(reqHost) {
+  if (CIG_CONFIG.fqdnLocked || !CIG_ENABLED) return;
+  if (!reqHost || reqHost === 'localhost' || reqHost.startsWith('127.') || reqHost.startsWith('[::1]')) return;
+  const fqdn = reqHost.split(':')[0].toLowerCase();
+  // Only accept real domain names (must contain a dot)
+  if (!fqdn || !fqdn.includes('.')) return;
+  // Enforce suffix restriction if configured (prevents Host-header poisoning)
+  if (CIG_ALLOWED_FQDN_SUFFIX && !fqdn.endsWith(CIG_ALLOWED_FQDN_SUFFIX)) {
+    console.warn(`[cig] Rejected FQDN auto-detect: ${fqdn} does not end with ${CIG_ALLOWED_FQDN_SUFFIX}`);
+    return;
+  }
+  CIG_CONFIG.containerFqdn = fqdn;
+  CIG_CONFIG.fqdnLocked = true;
+  console.log(`[cig] Auto-detected container FQDN from Host header: ${fqdn}`);
+}
+
 async function mintCigToken() {
   // Return cached token if still valid (with refresh buffer)
   if (cigTokenCache.token && Date.now() < cigTokenCache.expiresAt - CIG_TOKEN_REFRESH_MS) {
     return cigTokenCache.token;
   }
 
-  // FQDN is required for per-container binding — fail hard if missing
+  // FQDN is required for per-container binding.
+  // Set via CIG_CONTAINER_FQDN / CONTAINER_FQDN env var, or auto-detected
+  // from external requests in handleRequest() (see FQDN auto-detection block).
   const fqdn = CIG_CONFIG.containerFqdn;
   if (!fqdn) {
-    throw new Error('CIG_CONTAINER_FQDN or CONTAINER_FQDN environment variable is required');
+    // FQDN not yet auto-detected — skip CIG for this request.
+    // Subsequent requests will have the FQDN after auto-detection.
+    console.warn('[cig] Cannot mint token: FQDN not yet detected (will auto-detect from Host header)');
+    const err = new Error(
+      'Container FQDN not available. Set CIG_CONTAINER_FQDN env var, ' +
+      'or ensure the user loads the chat UI before the first inference call '
+      + '(the FQDN is auto-detected from the first external HTTP request).'
+    );
+    err.code = 'fqdn_not_detected';
+    throw err;
   }
 
   const controller = new AbortController();
@@ -536,7 +667,32 @@ async function handleCigProxy(req, res, url) {
     const bodyBuf = Buffer.concat(chunks);
 
     // Mint or reuse cached CIG token
-    const cigToken = await mintCigToken();
+    let cigToken;
+    try {
+      cigToken = await mintCigToken();
+    } catch (mintErr) {
+      // FQDN not yet detected — return 503 Retry-After so OpenClaw retries
+      // instead of treating it as a hard failure ("assistant turn failed").
+      // The FQDN will be auto-detected from the first browser request's Host header.
+      if (mintErr.code === 'fqdn_not_detected' || mintErr.message.includes('FQDN not yet detected')) {
+        console.warn('[cig-proxy] Returning 503 (FQDN not yet detected) — OpenClaw should retry');
+        res.writeHead(503, {
+          'Content-Type': 'application/json',
+          'Retry-After': '5',
+          'X-Cig-Status': 'fqdn-pending',
+        });
+        res.end(JSON.stringify({
+          error: {
+            message: 'CIG FQDN not yet detected — retry shortly',
+            type: 'proxy_error',
+            code: 'fqdn_pending',
+            retryable: true,
+          },
+        }));
+        return;
+      }
+      throw mintErr; // Re-raise other mint errors (will be caught below)
+    }
 
     // Forward to CIG inference endpoint, preserving pathname + query string
     // Note: CIG_CONFIG.inferenceUrl path (e.g. /functions/v1/cig-inference) is the
@@ -602,10 +758,30 @@ async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname;
 
+  // Auto-detect FQDN from first external request (buffer pool containers)
+  if (CIG_ENABLED && !CIG_CONFIG.fqdnLocked) {
+    maybeAutoDetectFqdn(req.headers.host);
+  }
+
   // ── Health check (no auth) ──
   if (pathname === '/health') {
+    const handoffHash = CONFIG.handoffSigningSecret
+      ? createHash('sha256').update(CONFIG.handoffSigningSecret).digest('hex').slice(0, 16)
+      : 'not_set';
+    const fqdnStatus = CIG_ENABLED
+      ? { detected: CIG_CONFIG.fqdnLocked, fqdn: CIG_CONFIG.containerFqdn || null }
+      : { enabled: false };
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', authProxy: true }));
+    res.end(JSON.stringify({
+      status: 'ok',
+      authProxy: true,
+      sso: {
+        enabled: !!CONFIG.handoffSigningSecret,
+        secretHashPrefix: handoffHash,
+        dynamicOwner: DYNAMIC_OWNER_MODE,
+      },
+      cig: fqdnStatus,
+    }));
     return;
   }
 
@@ -697,12 +873,191 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // ── FQDN auto-detection from external requests ──
+  // Internal OpenClaw inference calls hit localhost:18789, but external browser
+  // requests arrive via Manifest ingress with the real FQDN as the Host header.
+  // Capture the FQDN from the first external request so the CIG handler can use it.
+  //
+  // SECURITY: The Host header is client-controlled. We validate the candidate:
+  //   1. Must contain a dot (rejects localhost, container names, bare words)
+  //   2. Must NOT be an IP literal (rejects 127.0.0.1, Docker bridge IPs)
+  //   3. Must match a known provider domain suffix when CIG_ALLOWED_FQDN_SUFFIX
+  //      is set (e.g. ".manifest0.net"), OR contain at least 2 labels + valid TLD
+  // The first valid external request wins and is cached for the container lifetime.
+  if (CIG_ENABLED && !CIG_CONFIG.containerFqdn) {
+    const hostCandidate = (req.headers.host || '').replace(/:\d+$/, '').toLowerCase();
+    if (hostCandidate.includes('.') && !/^\d{1,3}(\.\d{1,3}){3}$/.test(hostCandidate)) {
+      // If an allowed suffix is configured, enforce it (e.g. ".manifest0.net")
+      const allowedSuffix = process.env.CIG_ALLOWED_FQDN_SUFFIX || '';
+      if (!allowedSuffix || hostCandidate.endsWith(allowedSuffix)) {
+        CIG_CONFIG.containerFqdn = hostCandidate;
+        console.log(`[cig-proxy] Auto-detected FQDN from external request: ${hostCandidate}`);
+      } else {
+        console.warn(`[cig-proxy] Rejected Host header '${hostCandidate}' — does not match allowed suffix '${allowedSuffix}'`);
+      }
+    }
+  }
+
   // ── CIG Proxy: Internal inference requests from OpenClaw ──
   // OpenClaw calls localhost:18789/v1/chat/completions (via mor-gateway provider)
   // We mint a CIG token and forward to the external CIG inference endpoint.
   // These are internal requests (no session cookie needed).
   if (CIG_ENABLED && pathname.startsWith('/v1/') && req.method === 'POST') {
     await handleCigProxy(req, res, url);
+    return;
+  }
+
+  // ── SSO Handoff — exchange single-use JWT for session cookie ──
+  // Receives a short-lived HS256 JWT via POST body (form-urlencoded).
+  // Validates JWT signature, expiry, FQDN match, and single-use (in-memory consumed set).
+  // On success: sets session cookie and 302 redirects to /.
+  // On failure: serves login page (fallback to current behavior).
+  if (pathname === '/auth/handoff' && req.method === 'POST') {
+    // SSO disabled — don't waste rate-limit slots or attempt JWT verify with empty key
+    if (!CONFIG.handoffSigningSecret) {
+      serveLoginPage(res, 404);
+      return;
+    }
+
+    // Rate limit: 5 attempts per minute per IP (shared AUTH_RATE_LIMIT)
+    const handoffIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    if (isRateLimited(handoffIp)) {
+      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+      res.end(JSON.stringify({ error: 'rate_limited', retryAfter: 60 }));
+      return;
+    }
+
+    try {
+      // Parse form-urlencoded body (auto-submitting HTML form)
+      const chunks = [];
+      let size = 0;
+      for await (const chunk of req) {
+        size += chunk.length;
+        if (size > MAX_BODY_BYTES) {
+          req.destroy();
+          throw new Error('Body too large');
+        }
+        chunks.push(chunk);
+      }
+      const rawBody = Buffer.concat(chunks).toString('utf8');
+      const params = new URLSearchParams(rawBody);
+      const token = params.get('token');
+
+      if (!token || typeof token !== 'string') {
+        console.log('[handoff] No token in POST body');
+        serveLoginPage(res, 401);
+        return;
+      }
+
+      // Verify HS256 JWT using HANDOFF_SIGNING_SECRET
+      let handoffPayload;
+      try {
+        const secretKey = new TextEncoder().encode(CONFIG.handoffSigningSecret);
+        const { payload } = await jwtVerify(token, secretKey, {
+          algorithms: ['HS256'],
+        });
+        handoffPayload = payload;
+      } catch (jwtErr) {
+        console.log(`[handoff] JWT verification failed: ${jwtErr.code || jwtErr.message}`);
+        serveLoginPage(res, 401);
+        return;
+      }
+
+      // Validate required claims
+      const { sub, fqdn: tokenFqdn, jti } = handoffPayload;
+      if (!sub || !tokenFqdn || !jti) {
+        console.log('[handoff] Missing required claims (sub, fqdn, jti)');
+        serveLoginPage(res, 401);
+        return;
+      }
+
+      // Single-use enforcement: check in-memory Map first (fast path only — don't consume yet)
+      if (consumedHandoffTokens.has(jti)) {
+        console.log(`[handoff] Token already consumed (in-memory): jti=${jti}`);
+        serveLoginPage(res, 401);
+        return;
+      }
+
+      // Validate FQDN: token must match this container's FQDN
+      const containerFqdn = (CONFIG.containerFqdn || req.headers.host || '').split(':')[0].toLowerCase();
+      const expectedFqdn = containerFqdn;
+      const tokenFqdnLower = String(tokenFqdn).toLowerCase();
+
+      if (tokenFqdnLower !== expectedFqdn) {
+        console.log(`[handoff] FQDN mismatch: token=${tokenFqdnLower} expected=${expectedFqdn}`);
+        serveLoginPage(res, 403);
+        return;
+      }
+
+      // Defense-in-depth: verify ownership via Supabase (same as /auth/callback)
+      if (DYNAMIC_OWNER_MODE) {
+        try {
+          const verifyResp = await fetch(CONFIG.verifyOwnerUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${CONFIG.verifyOwnerSecret}`,
+            },
+            body: JSON.stringify({
+              fqdn: expectedFqdn,
+              privy_user_id: sub,
+            }),
+            signal: AbortSignal.timeout(5000),
+          });
+
+          if (!verifyResp.ok) {
+            console.log(`[handoff] verify-owner returned ${verifyResp.status}`);
+            serveLoginPage(res, 403);
+            return;
+          }
+
+          const result = await verifyResp.json();
+          if (!result.authorized) {
+            console.log(`[handoff] Owner check failed: sub=${sub} fqdn=${expectedFqdn}`);
+            serveLoginPage(res, 403);
+            return;
+          }
+        } catch (fetchErr) {
+          console.error(`[handoff] verify-owner error: ${fetchErr.message}`);
+          serveLoginPage(res, 403);
+          return;
+        }
+      }
+
+      // All validations passed — NOW consume the token (DB-backed atomic single-use)
+      const dbResult = await dbConsumeHandoffToken(jti);
+      if (!dbResult.consumed) {
+        // DB says already consumed or unavailable — fail closed
+        console.log(`[handoff] Token rejected by DB: jti=${jti} reason=${dbResult.error}`);
+        serveLoginPage(res, 401);
+        return;
+      }
+
+      // Mark token as consumed in-memory
+      consumedHandoffTokens.set(jti, Date.now());
+
+      // Create signed session cookie (same as /auth/callback)
+      const sessionValue = signSession(sub);
+      const cookieOpts = getCookieOptions(req);
+
+      console.log(`[handoff] ✓ SSO handoff successful: sub=${sub} fqdn=${expectedFqdn} jti=${jti}`);
+
+      res.writeHead(302, {
+        'Set-Cookie': cookie.serialize(COOKIE_NAME, sessionValue, cookieOpts),
+        'Location': '/',
+      });
+      res.end();
+      return;
+    } catch (error) {
+      console.error('[handoff] Error:', error.message);
+      serveLoginPage(res, 500);
+      return;
+    }
+  }
+
+  // ── GET /auth/handoff without POST → serve login page ──
+  if (pathname === '/auth/handoff' && req.method === 'GET') {
+    serveLoginPage(res);
     return;
   }
 
@@ -777,7 +1132,7 @@ async function main() {
   console.log('🔒 OpenClaw Auth Proxy');
   console.log('');
 
-  validateConfig();
+  await validateConfig();
   await initializeVerificationKey();
   await loadLoginPage();
 

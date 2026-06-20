@@ -1,10 +1,9 @@
 {
-  "name": "Morpheus Skill",
-  "slug": "morpheus-skill",
-  "domain": "morpheusclaw.com",
-  "description": "The canonical Morpheus decentralized AI agent skill for OpenClaw",
-  "remote": "https://github.com/profbernardoj/morpheus-skill.git",
+  "name": "Office Claw",
+  "slug": "officeclaw-org",
+  "domain": "officeclaw.org",
+  "description": "AI agent for office management",
+  "remote": "https://github.com/profbernardoj/officeclaw.org.git",
   "defaultModel": "glm-5",
-  "persona": "Morpheus decentralized AI assistant",
-  "canonical": true
+  "persona": "Office management AI assistant"
 }
